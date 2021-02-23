@@ -1,0 +1,308 @@
+
+### Ali Tavakolzadeh
+
+### Introduction
+
+For this assignment, we picked the 'Stock Returns 1931-2002' data set. 
+
+### Data Description
+
+This data set contains 2 columns: 
+
+  *1. ExReturns: Excess Returns- are returns achieved above and beyond the return of a   proxy.  
+  *2. ln_DivYield: 100×ln(dividend yield). -equals the annual dividend per share divided by the stock's price per share. 
+  
+It has one row per every month during thee years of 1931-2002, giving us a total of 864 rows.  
+
+### Data Exploration  
+
+First we loaded the data and the libraries we needed to do the models and evaluate them:
+
+```{r warning=FALSE, message=FALSE}
+library(readxl)
+library(astsa) 
+library(tseries) 
+library(dynlm)  
+library(forecast)
+library(devtools)
+library(Rcpp)
+library(usethis)
+library(StanHeaders)
+library(prophet)
+Returns =read_excel("Stock_Returns_1931_2002.xlsx")
+head(Returns)
+```  
+
+Check for missing values in the data set: 
+
+```{r}
+sum(is.na(Returns))
+```  
+
+Check the structure of the data:  
+
+```{r}
+str(Returns)
+```  
+
+Given that it is not a T.S, we need to transform the data set to a Time Series so we can apply out models.  
+
+```{r}
+market= ts(Returns[,3:4],
+        start=c(1931,1),
+        end = c(2002,12),
+        frequency = 12)
+```  
+
+Let's see the plot of out Time Series:  
+
+```{r}
+plot(market, col='green')
+```  
+
+So far, for our main variable 'ExReturn' we don't see any trend going on, but for the additional variable we can observe a decreasing trend at the end of the time series. Let's remove that trend:  
+
+```{r}
+DY=ts(Returns$ln_DivYield,
+    start=c(1931,1),
+    end = c(2002,12),
+    frequency = 12)
+diff_DY=diff(DY)
+plot(diff_DY,col='blue',lwd=1,ylab="100log(DY)",main="Dividend Yield for CRSP Index")
+```  
+
+Let's now see both Time Series side by side:  
+
+```{r}
+par(mfrow=c(2,1)) 
+ER=ts(Returns$ExReturn,
+      start=c(1931,1),
+      end = c(2002,12),
+      frequency = 12)
+plot(ER,col='red',lwd=1,ylab="ExReturn",main="Excess Return for CRSP Index")
+plot(diff_DY,col='blue',lwd=1,ylab="100log(DY)",main="Dividend Yield for CRSP Index")
+```  
+```
+```
+As we can see, there is no more trend on the 'Dividend Yield' time series; but we can observe that the data before 1940 is unusual compare to the rest of the data. This could cause some issues at the time of modeling. Let's drop all the data before 1940, this won't affect our model because we have enough data for forecasting.  
+
+```{r}
+ER = ts(Returns$ExReturn[109:864],
+        start=c(1940,1),
+        end = c(2002,12),
+        frequency = 12)
+DY = ts(Returns$ln_DivYield[109:864],
+        start=c(1940,1),
+        end = c(2002,12),
+        frequency = 12)
+diff_DY=diff(DY)
+par(mfrow=c(2,1)) 
+plot(ER,col='red',lwd=1,ylab="ExReturn",main="Excess Return for CRSP Index")
+plot(diff_DY,col='blue',lwd=1,ylab="100log(DY)",main="Dividend Yield for CRSP Index")
+```  
+
+Now that the plots look so much better after removing unsual data and trend, we need to check the correlation between this two variables.  
+
+```{r}
+ccf(ER,diff_DY)
+cor(ER[-1],diff_DY)
+plot(ER[-1],diff_DY)
+```  
+
+As we can see, they are highly negatively correlated.
+
+### Splitting Data  
+
+We are going to take 80% of the data to be the 'Train' set and 20% to be the 'Test' set. 
+
+```{r}
+size = length(ER)
+train = 1:round(size*0.8)
+test = round(1+size*0.8):size
+```  
+### Modeling
+
+#### Method(1): SARIMA without including additional variables  
+
+##### Fitting Model  
+
+Let's take a lookk at thee ACF and PACF, and see if we can come up with something from there.  
+
+```{r}
+acf2(ER)
+```
+
+So the plot is not telling us much about what type of model we can apply in this cases we can fit ARIMA(1,0,1) or use the function  'auto.arima()' to find a good starting point: 
+
+```{r}
+sarima_fit = auto.arima(ER[train],ic="aic",start.p = 0,start.q = 0,start.P = 0,start.Q = 0,stepwise = F,max.P = 5,max.Q = 5,approximation = F)
+summary(sarima_fit)
+```  
+
+The function says ARIMA(1,0,1) is the best model for our data, so let's take a look at the residuals:  
+
+```{r}
+sarima(ER[train],1,0,1)
+```  
+
+The residuals look really good, nothing above thee blue threshold, the p-values on the JLung-Box Statistic show that the residuals are not correlated; therefor we can say that it is a good model. Now, let's do some predictions.  
+
+##### Prediction and Test Fitting 
+
+```{r}
+preds = Arima(ER[test],model = sarima_fit)
+``` 
+
+Now, let's see how well our predictions fit the test portion of the original data set. 
+
+```{r}
+plot(ER,ylab="Excess Returns",main="One-Step Prediction with Fitted Model")
+lines(time(ER)[test],ER[test],col='blue')
+lines(time(ER)[test],preds$fitted,col='red')
+legend(1948,34,legend = c("Train Data","Test Data","Predicted Data"),col=c("black","blue","red"),lty=c(1,1,1))
+```   
+
+So, the mean of our prediction doesn't look bad, but our variance does. We will fix this later on the project. For now let's check the MSPE of our model.
+
+##### MSPE  
+
+```{r}
+MSPE = mean((ER[test]-preds$fitted)^2)
+MSPE 
+```  
+
+#### Method(2): SARIMA with additional variables  
+
+##### Fitting Model 
+
+First we are going to make data frame from both time series:
+
+```{r}
+Stock = ts.intersect(diff_DY, ER[-1],dframe = TRUE) 
+```  
+
+Now, let's fit a linear regression where the dependent variable is the 'Diff_DY'.
+
+```{r}
+summary(fit <- lm(diff(DY[train]) ~ER[train][-1], data = Stock))
+acf2(resid(fit))
+``` 
+
+We would like to explore if applying a dummy variable will help to improve the model. 
+
+```{r}
+dummy = ifelse(ER[-1]<0,0,1)
+summary(fit <- lm(diff(DY[train]) ~ER[train][-1]*dummy[train][-1], data = Stock))
+acf2(resid(fit))
+``` 
+
+As we can see, there is not difference between using a dummy variable or not using it, so we are going to drop it.  
+
+We tried ARMA(1,2), ARMA(2,1), ARMA(3,1), ARMA(3,2),... then based on the ACF and PACF, we can observe that for the regular part both of them 'tail off' after lag 3, that suggests an ARMA(3,3), and since we already applied a difference is an ARIMA (3,1,3).  
+
+For the seasonality part, we should check several different model to find which works better.  
+
+Let's test these results:  
+
+```{r}
+out = arima(DY[train],c(3,1,3),seasonal=list(order=c(0,0,1),period=12),xreg=cbind(ER[train]))
+acf2(out$residuals)
+sarima_fit <- sarima(DY[train],3,1,3,P=0,D=0,Q=1,S=12,xreg=cbind(ER[train]))
+Box.test(sarima_fit$fit$residuals)
+``` 
+
+Even though, the p-values on thee Ljung-Box Statistic doesn't seem too good, the p-value we obtain on the Box-test and the ACF of the residuals is enough proof to say that we have a good model. Now we must test it doing some predictions.
+
+##### Prediction and Test Fitting   
+
+```{r}
+fit = Arima(DY[train],c(3,1,3),seasonal=list(order=c(0,0,1),period=12),xreg=cbind(ER[train]))
+fit2 =Arima(DY[test],c(3,0,3),seasonal=list(order=c(0,0,1),period=12),xreg=cbind(ER[test]),model=fit)
+onestep =fitted(fit2)
+plot(DY,ylab="Excess Returns",main="One-Step Prediction with Fitted Model")
+lines(time(DY)[test],DY[test],col='blue')
+lines(time(DY)[test],fit2$fitted,col='red')
+legend(1948,34,legend = c("Train Data","Test Data","Predicted Data"),col=c("black","blue","red"),lty=c(1,1,1))
+``` 
+
+As we can observe, our prediction is really similar to the test proportion of our data. Now, we have to check out MSPE:
+
+```{r}
+MSPE = mean((as.vector(DY[test])-as.vector(onestep))^2)
+MSPE
+``` 
+
+##### Testing approach on ExReturns column  
+In the first model we make predication for ExReturns column and got MSPE=15.33478. In the second model we got MSPE=6.146392 for Dividend values so we can not make a comparison with these two MSPE so let's try our second model to predict Exreturns as well and make a reasonable comparison
+
+
+```{r}
+fit <- Arima(ER[train][-1],c(3,0,3),seasonal=list(order=c(0,0,1),period=12),xreg=cbind(diff(DY[train])))
+fit2 <- Arima(ER[test][-1],c(3,0,3),seasonal=list(order=c(0,0,1),period=12),xreg=cbind(diff(DY[test])),model=fit)
+onestep <- fitted(fit2)
+plot(ER,ylab="Excess Returns",main="One-Step Prediction with Fitted Model")
+lines(time(ER)[test],ER[test],col='blue')
+lines(time(ER)[test][-1],fit2$fitted,col='red')
+legend(1948,34,legend = c("Train Data","Test Data","Predicted Data"),col=c("black","blue","red"),lty=c(1,1,1))
+``` 
+  
+As we can see again, our prediction is really similar to the test proportion of our data. We can obtain a really good MSPE from this model:
+```{r}
+MSPE = mean((as.vector(ER[test][-1])-as.vector(onestep))^2)
+MSPE
+```
+
+As expected, the MSPE after adding an additional variable and seasonality improved compare to the first MSPE we obtained with SARIMA without additional variable.
+
+## Method(3): Prophet
+
+### Fitting Model  
+
+First we need to crate a new data frame that only contains the data and the values of the 'Excess Returns'. As for previous model, we added a monthly factor as thee frequency. 
+
+
+```{r,message=FALSE,warning=FALSE}
+ds = seq(as.Date("1940-01-01"),as.Date("2002-12-01"),by='months')[train]
+y = ER[train]
+df = data.frame(ds,y)
+prophet_model = prophet(df)
+```
+
+
+```{r}
+df_fututre = make_future_dataframe(prophet_model,periods = length(test),freq = "month",include_history=FALSE)
+forecast = predict(prophet_model,df_fututre)
+```
+
+### Checking MSE
+```{r}
+MSPE = mean((ER[test]-na.omit(forecast$yhat))^2)
+sprintf("MSPE: %.2f",MSPE)
+```
+
+
+```{r}
+plot(prophet_model,forecast,ylab="Excess Returns",xlab="Time",main="Prophet's Model Prediction")
+```
+
+
+
+# Conclusion  
+```{r table2, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+tab = "
+  |        | Method One | Method Two  | Method 3 |
+  |--------|:----------:|:-----------:|:--------:|
+  |MSPE     | 15.33748  | 0.668324    | 15.08    |   
+  "
+cat(tab)
+```
+
+
+
+Fitting a good model for the stock market predictions is a difficult task, since its price is based on each investor future expectations for the companies given the current news about them, hence the past values don't play a big role in the future value. 
+ 
+
+
+
+
+
